@@ -525,9 +525,14 @@ async def main():
                     save_profile_to_db(u, res, depth=1, pre_filtered=True, filter_reason=reason)
                 else:
                     ai = await analyze_with_ai(u, res.get("bio", ""), res.get("tweets", []))
-                    verdict = "STARTUP" if ai["is_valuable"] else "skip"
-                    print(f"{verdict} [{ai['category']}]")
-                    save_profile_to_db(u, res, depth=1, ai_res=ai)
+                    if ai.get("red_flags") == "AI error":
+                        print("AI error (retry later)")
+                        save_profile_to_db(u, res, depth=1, ai_res=None)
+                        ai = None
+                    else:
+                        verdict = "STARTUP" if ai["is_valuable"] else "skip"
+                        print(f"{verdict} [{ai['category']}]")
+                        save_profile_to_db(u, res, depth=1, ai_res=ai)
 
             if ai and ai["is_valuable"]:
                 d1_analyzed.append({"scraped": res, "ai": ai, "depth": 1})
@@ -586,9 +591,14 @@ async def main():
                     save_profile_to_db(u, res, depth=2, pre_filtered=True, filter_reason=reason)
                 else:
                     ai = await analyze_with_ai(u, res.get("bio", ""), res.get("tweets", []))
-                    verdict = "STARTUP" if ai["is_valuable"] else "skip"
-                    print(f"{verdict} [{ai['category']}]")
-                    save_profile_to_db(u, res, depth=2, ai_res=ai)
+                    if ai.get("red_flags") == "AI error":
+                        print("AI error (retry later)")
+                        save_profile_to_db(u, res, depth=2, ai_res=None)
+                        ai = None
+                    else:
+                        verdict = "STARTUP" if ai["is_valuable"] else "skip"
+                        print(f"{verdict} [{ai['category']}]")
+                        save_profile_to_db(u, res, depth=2, ai_res=ai)
 
             if ai and ai["is_valuable"]:
                 d2_analyzed.append({"scraped": res, "ai": ai, "depth": 2})
