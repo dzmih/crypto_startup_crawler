@@ -85,10 +85,10 @@ SKIP_ACCOUNTS.update([a.lower() for a in SEED_ACCOUNTS])
 MAX_DEPTH1          = _env_int("CSR_MAX_DEPTH1", 50)
 MAX_DEPTH2          = _env_int("CSR_MAX_DEPTH2", 60)
 SCROLL_ROUNDS       = _env_int("CSR_SCROLL_ROUNDS", 5)       # прокруток для обычного профиля
-SCROLL_ROUNDS_MIN   = _env_int("CSR_SCROLL_ROUNDS_MIN", 2)   # минимум для низкоприоритетных
-MAX_CONCURRENT      = _env_int("CSR_MAX_CONCURRENT", 6)
+SCROLL_ROUNDS_MIN   = _env_int("CSR_SCROLL_ROUNDS_MIN", 1)   # минимум для низкоприоритетных
+MAX_CONCURRENT      = int(os.environ.get("CSR_CONCURRENT", "3"))
 HEADLESS            = _env_bool("CSR_HEADLESS", True)
-OLLAMA_MODEL        = os.environ.get("CSR_OLLAMA_MODEL", "gemma2:27b")
+OLLAMA_MODEL        = os.environ.get("CSR_OLLAMA_MODEL", "llama3.1:8b")
 REPORT_FILE         = os.environ.get("CSR_REPORT_FILE", "report.md")
 # Имя БД можно переопределить через переменную окружения (для NAS/сетевых дисков)
 DB_NAME             = os.environ.get("STARTUPS_DB", "startups.db")
@@ -249,6 +249,15 @@ class CircuitBreaker:
         return time.monotonic() < self._open_until
 
 _ollama_cb = CircuitBreaker(OLLAMA_CB_THRESHOLD, OLLAMA_CB_SLEEP_SEC)
+
+# Переиспользуемый AI-клиент (не создаём заново на каждый вызов)
+_ollama_client: ollama.AsyncClient | None = None
+
+def get_ollama_client() -> ollama.AsyncClient:
+    global _ollama_client
+    if _ollama_client is None:
+        _ollama_client = ollama.AsyncClient()
+    return _ollama_client
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REGEX И ПРИОРИТИЗАЦИЯ
@@ -456,8 +465,8 @@ def _get_profile_sync(username: str) -> dict | None:
         }
 
 async def get_profile_from_db(username: str) -> dict | None:
-    async with _db_lock:
-        return await asyncio.to_thread(_get_profile_sync, username)
+    # Чтение не требует блокировки — SQLite WAL поддерживает конкурентные читатели
+    return await asyncio.to_thread(_get_profile_sync, username)
 
 def _save_profile_sync(username: str, scraped_data: dict, depth: int,
                        ai_res: dict | None = None, pre_filtered: bool = False,
@@ -472,6 +481,8 @@ def _save_profile_sync(username: str, scraped_data: dict, depth: int,
 
     is_valuable = None
     category = stage = pitch = red_flags = None
+    db_pre_filtered = int(pre_filtered)
+    db_filter_reason = filter_reason
 
     if ai_res:
         is_valuable = 1 if ai_res.get("is_valuable") else 0
@@ -490,6 +501,21 @@ def _save_profile_sync(username: str, scraped_data: dict, depth: int,
 
     with sqlite3.connect(DB_NAME) as conn:
         cur = conn.cursor()
+        if ai_res:
+            cur.execute("SELECT parsed_at FROM startups WHERE username = ?", (canon,))
+            row = cur.fetchone()
+            if row and row[0]:
+                parsed_at = row[0]
+
+        if not ai_res and not pre_filtered:
+            cur.execute("""
+                SELECT is_valuable, category, stage, pitch, red_flags, pre_filtered, filter_reason
+                FROM startups WHERE username = ?
+            """, (canon,))
+            row = cur.fetchone()
+            if row:
+                is_valuable, category, stage, pitch, red_flags, db_pre_filtered, db_filter_reason = row
+
         cur.execute("""
             INSERT OR REPLACE INTO startups (
                 username, display_username, url, bio, depth,
@@ -497,7 +523,7 @@ def _save_profile_sync(username: str, scraped_data: dict, depth: int,
                 pre_filtered, filter_reason, parsed_at, ai_due
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (canon, display, url, bio, depth, is_valuable, category, stage,
-              pitch, red_flags, int(pre_filtered), filter_reason, parsed_at, int(ai_due)))
+              pitch, red_flags, int(db_pre_filtered), db_filter_reason, parsed_at, int(ai_due)))
         cur.execute("DELETE FROM tweets WHERE username = ?", (canon,))
         cur.execute("DELETE FROM mentions WHERE username = ?", (canon,))
         cur.executemany("INSERT INTO tweets (username, tweet) VALUES (?,?)",
@@ -557,11 +583,20 @@ def _count_ai_due_sync() -> int:
 # SCRAPING LOGIC
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Слова, которые однозначно означают «не стартап» — не тратим AI-токены
+_PRE_FILTER_WORDS = [
+    "exchange", "journalist", "reporter", "newsletter", "media outlet",
+    "venture capital", "vc firm", "hedge fund", "news outlet",
+    "podcast host", "influencer", "price alert", "signals channel",
+    "airdrop hunter", "copy trading",
+]
+
 def pre_filter_check(bio: str, tweets: list[str]) -> tuple[bool, str | None]:
-    combined = (bio + " " + " ".join(tweets)).lower()
-    for word in ["exchange", "journalist"]:
-        if re.search(rf"\b{word}\b", combined):
-            return True, word
+    combined = (bio + " " + " ".join(tweets[:3])).lower()  # только первые 3 твита
+    for phrase in _PRE_FILTER_WORDS:
+        pattern = rf"\b{re.escape(phrase)}\b"
+        if re.search(pattern, combined):
+            return True, phrase
     return False, None
 
 async def get_or_scrape_profile(context, username: str, depth: int,
@@ -569,20 +604,26 @@ async def get_or_scrape_profile(context, username: str, depth: int,
     """Возвращает кэш если TTL актуален, иначе парсит страницу."""
     cached = await get_profile_from_db(username)
     if cached:
-        if is_cache_valid(cached.get("parsed_at")):
+        has_tweets = len(cached.get("scraped", {}).get("tweets", [])) > 0
+        effective_ttl = CACHE_TTL_HOURS if has_tweets else 4
+        if is_cache_valid(cached.get("parsed_at"), ttl_hours=effective_ttl):
             _metrics.cache_hits += 1
-            logging.info(f"  [Кэш ✓] @{username} — актуален")
+            logging.info(f"  [Кэш ✓] @{username} — актуален ({'есть твиты' if has_tweets else '0 твитов, кулдаун'})")
             return cached["scraped"]
         else:
             _metrics.ttl_expired += 1
-            logging.info(f"  [Кэш ↺] @{username} — TTL истёк, пересканируем")
+            logging.info(f"  [Кэш ↺] @{username} — TTL истёк ({'есть твиты' if has_tweets else '0 твитов, рескан'}), пересканируем")
 
     res = await scrape_profile(context, username, score=score)
     if res:
         _metrics.scraped += 1
         # Сохраняем как «нет вердикта AI» — пометим ai_due=True
         await save_profile_to_db(username, res, depth=depth, ai_due=True)
-    return res
+        return res
+    elif cached:
+        logging.warning(f"  [Рескан ⚠] Ошибка парсинга @{username}, используем кэшированную версию")
+        return cached["scraped"]
+    return None
 
 async def _try_get_bio(page) -> str:
     for sel in BIO_SELECTORS:
@@ -645,6 +686,11 @@ async def scrape_profile(context, username: str, score: int = 0) -> dict | None:
     async with get_sem():
         try:
             page = await context.new_page()
+            # Блокируем загрузку тяжелых ресурсов (ОУР.5)
+            await page.route("**/*", lambda route: route.abort() 
+                if route.request.resource_type in ("image", "media", "font", "stylesheet") 
+                else route.continue_()
+            )
         except Exception:
             logging.error(f"  [{username}] Ошибка создания вкладки:\n{traceback.format_exc()}")
             return None
@@ -727,45 +773,24 @@ async def scrape_profile(context, username: str, score: int = 0) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def analyze_with_ai(username: str, bio: str, tweets: list[str]) -> dict:
-    tweets_text = "\n".join(f"• {t[:300]}" for t in tweets[:15]) or "(no tweets)"
+    # Берём только 5 самых коротких/информативных твитов по 150 символов — достаточно для классификации
+    tweets_text = "\n".join(f"• {t[:150]}" for t in tweets[:5]) or "(no tweets)"
+    # Обрезаем bio до 300 символов
+    bio_short = (bio or "(no bio)")[:300]
 
-    prompt = f"""You are a sharp early-stage crypto investor analyst.
+    prompt = f"""Crypto investor analyst. Is @{username} an early-stage Web3/crypto TECHNOLOGY STARTUP?
 
-Evaluate this Twitter profile and decide if it represents an early-stage Web3 / crypto TECHNOLOGY STARTUP worth tracking for investment.
+Bio: {bio_short}
+Tweets: {tweets_text}
 
-Profile: @{username}
-Bio: {bio or '(no bio)'}
-Recent tweets:
-{tweets_text}
-
-=== STRICT CLASSIFICATION RULES ===
-Mark is_valuable=TRUE only when ALL are true:
-1. Product-building team (protocol, app, tool, infrastructure)
-2. Web3 / crypto / blockchain space
-3. Early-to-growth stage (NOT Uniswap/Aave/Compound/MakerDAO level with billions in TVL)
-
-Mark is_valuable=FALSE if ANY applies:
-- VC fund, accelerator, or investor account
-- Media, news, event, advocacy, or lobbying account
-- Personal account of investor / journalist / politician
-- Large established protocol or exchange
-- Memecoin, pure NFT project, spam
-- Non-crypto company or unrelated topic
-
-=== SPECIAL RULE — VC-BACKED STARTUP ===
-Bio phrases like "Backed by Paradigm", "Funded by a16z", "@[VC] investor" → STRONG evidence of a startup. Mark is_valuable=TRUE.
-Bio phrases like "building", "the first X on-chain", "protocol", "we're building" → lean TRUE.
+TRUE if: building a product (protocol/app/tool/infra) + web3/crypto + early stage.
+FALSE if: VC fund, media, journalist, politician, large exchange, memecoin, spam.
+VC-backed startups ("Backed by Paradigm", "Funded by a16z") → TRUE.
 
 Categories: {CATEGORIES}
 
-Return ONLY valid JSON:
-{{
-  "is_valuable": true/false,
-  "category": "<category>",
-  "stage": "<seed | early | growth | established | unknown>",
-  "pitch": "<2-3 sentences: problem solved and why an investor would care>",
-  "red_flags": "<key concerns or empty string>"
-}}"""
+JSON only:
+{{"is_valuable":true/false,"category":"<cat>","stage":"<seed|early|growth|established|unknown>","pitch":"<1-2 sentences>","red_flags":"<concerns or empty>"}}"""
 
     if _ollama_cb.is_open():
         logging.warning(f"  [{username}] Circuit breaker открыт — пропускаем")
@@ -775,7 +800,7 @@ Return ONLY valid JSON:
 
     for attempt in range(3):
         try:
-            client = ollama.AsyncClient()
+            client = get_ollama_client()
             resp = await asyncio.wait_for(
                 client.generate(
                     model=OLLAMA_MODEL,
@@ -844,6 +869,7 @@ async def analyze_profile(u: str, res: dict, depth: int) -> dict | None:
             else:
                 verdict = "STARTUP" if ai["is_valuable"] else "skip"
                 logging.info(f"  Анализ @{u}... [Кэш AI] {verdict} [{ai['category']}]")
+            ai["_is_fresh"] = False
             return ai
         else:
             logging.info(f"  Анализ @{u}... [Кэш AI истёк] повторный анализ")
@@ -868,6 +894,7 @@ async def analyze_profile(u: str, res: dict, depth: int) -> dict | None:
     verdict = "STARTUP" if ai["is_valuable"] else "skip"
     logging.info(f"  Анализ @{u}... {verdict} [{ai['category']}]")
     await save_profile_to_db(u, res, depth=depth, ai_res=ai)
+    ai["_is_fresh"] = True
     return ai
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -921,6 +948,18 @@ def generate_report(startups: list[dict]) -> str:
 
     return "\n".join(lines)
 
+async def save_reports_live(d1: list[dict], d2: list[dict], history_report_path: Path, main_report_path: Path):
+    try:
+        all_startups = await asyncio.to_thread(_load_all_valuable_sync)
+        report_content = generate_report(all_startups)
+        await asyncio.to_thread(main_report_path.write_text, report_content, encoding="utf-8")
+        
+        run_startups = [s for s in (d1 + d2) if s.get("ai", {}).get("_is_fresh")]
+        history_report_content = generate_report(run_startups)
+        await asyncio.to_thread(history_report_path.write_text, history_report_content, encoding="utf-8")
+    except Exception as exc:
+        logging.error(f"Ошибка сохранения live-отчета: {exc}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ГЛАВНЫЙ КРАУЛЕР
 # ─────────────────────────────────────────────────────────────────────────────
@@ -931,6 +970,15 @@ async def main():
 
     await init_db()
 
+    main_report = Path(REPORT_FILE)
+    reports_dir = main_report.parent / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    history_report = reports_dir / f"{main_report.stem}_{timestamp}{main_report.suffix}"
+    
+    # Write initial empty history report so it shows in the dropdown immediately
+    await asyncio.to_thread(history_report.write_text, "# Отчет о запуске\n\nПоиск стартапов в процессе...\n", encoding="utf-8")
+
     logging.info("=" * 60)
     logging.info("  CRYPTO STARTUP RADAR v3.2 — краулер запущен")
     logging.info(f"  Параллельность: {MAX_CONCURRENT}  |  Seed: {len(SEED_ACCOUNTS)}")
@@ -938,8 +986,10 @@ async def main():
     logging.info("=" * 60)
 
     global_visited: set[str] = {s.lower() for s in SEED_ACCOUNTS}
-    # score_map хранит лучший score для каждого кандидата
     score_map: dict[str, int] = {}
+
+    d1_analyzed: list[dict] = []
+    d2_analyzed: list[dict] = []
 
     p = await async_playwright().start()
     try:
@@ -949,7 +999,12 @@ async def main():
             user_data_dir="twitter_profile",
             channel="chrome",
             headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-dev-shm-usage",
+            ],
             user_agent=ua,
         )
         try:
@@ -999,7 +1054,6 @@ async def main():
 
             # ── ФАЗА 3: AI-анализ глубины 1 ──────────────────────────────────────
             logging.info("[3/4] AI-анализ глубины 1...")
-            d1_analyzed: list[dict] = []
             depth2_scored: dict[str, tuple[str, int]] = {}
 
             for res in d1_scraped:
@@ -1012,6 +1066,7 @@ async def main():
 
                 if ai and ai["is_valuable"]:
                     d1_analyzed.append({"scraped": res, "ai": ai, "depth": 1})
+                    await save_reports_live(d1_analyzed, d2_analyzed, history_report, main_report)
                     all_texts = [res.get("bio", "")] + res.get("tweets", [])
                     for mention, ctx in extract_mentions_with_context(all_texts):
                         lo = mention.lower()
@@ -1051,7 +1106,6 @@ async def main():
         await p.stop()
 
     # ── AI-анализ глубины 2 ────────────────────────────────────────────────────
-    d2_analyzed: list[dict] = []
     if 'd2_scraped' in locals() and d2_scraped:
         logging.info(f"\nAI-анализ {len(depth2_list)} кандидатов глубины 2...")
         for res in d2_scraped:
@@ -1063,27 +1117,22 @@ async def main():
             ai = await analyze_profile(u, res, depth=2)
             if ai and ai["is_valuable"]:
                 d2_analyzed.append({"scraped": res, "ai": ai, "depth": 2})
+                await save_reports_live(d1_analyzed, d2_analyzed, history_report, main_report)
 
     # ── Отчёт ─────────────────────────────────────────────────────────────────
     all_startups = await asyncio.to_thread(_load_all_valuable_sync)
     _metrics.startups_found = len(all_startups)
     _metrics.ai_due_pending += await asyncio.to_thread(_count_ai_due_sync)
 
-    report_content = generate_report(all_startups)
-    
-    main_report = Path(REPORT_FILE)
-    await asyncio.to_thread(main_report.write_text, report_content, encoding="utf-8")
-    
-    reports_dir = main_report.parent / "reports"
-    reports_dir.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    history_report = reports_dir / f"{main_report.stem}_{timestamp}{main_report.suffix}"
-    await asyncio.to_thread(history_report.write_text, report_content, encoding="utf-8")
+    # Записываем финальные отчеты на всякий случай
+    await save_reports_live(d1_analyzed, d2_analyzed, history_report, main_report)
+
+    run_startups = [s for s in (d1_analyzed + d2_analyzed) if s.get("ai", {}).get("_is_fresh")]
 
     # Итоговые метрики
     logging.info(_metrics.summary())
     logging.info(f"  Глубина 1: {len(d1_analyzed)}  |  Глубина 2: {len(d2_analyzed)}")
-    logging.info(f"  Отчёт: {main_report} (копия: {history_report})")
+    logging.info(f"  Отчёт: {main_report} (копия: {history_report} с {len(run_startups)} новыми)")
 
 
 if __name__ == "__main__":

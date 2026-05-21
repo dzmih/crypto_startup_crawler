@@ -138,7 +138,11 @@ def _sqlite_save(username: str, scraped: dict, depth: int,
     mentions = scraped.get("mentions", [])
     parsed_at = datetime.now().isoformat()
 
-    is_valuable = category = stage = pitch = red_flags = None
+    is_valuable = None
+    category = stage = pitch = red_flags = None
+    db_pre_filtered = int(pre_filtered)
+    db_filter_reason = filter_reason
+
     if ai_res:
         is_valuable = 1 if ai_res.get("is_valuable") else 0
         category    = ai_res.get("category") or "Other"
@@ -156,13 +160,28 @@ def _sqlite_save(username: str, scraped: dict, depth: int,
 
     with sqlite3.connect(_DB_NAME) as conn:
         cur = conn.cursor()
+        if ai_res:
+            cur.execute("SELECT parsed_at FROM startups WHERE username = ?", (canon,))
+            row = cur.fetchone()
+            if row and row[0]:
+                parsed_at = row[0]
+
+        if not ai_res and not pre_filtered:
+            cur.execute("""
+                SELECT is_valuable, category, stage, pitch, red_flags, pre_filtered, filter_reason
+                FROM startups WHERE username = ?
+            """, (canon,))
+            row = cur.fetchone()
+            if row:
+                is_valuable, category, stage, pitch, red_flags, db_pre_filtered, db_filter_reason = row
+
         cur.execute("""
             INSERT OR REPLACE INTO startups
               (username,display_username,url,bio,depth,is_valuable,category,stage,
                pitch,red_flags,pre_filtered,filter_reason,parsed_at,ai_due)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (canon, display, url, bio, depth, is_valuable, category, stage,
-              pitch, red_flags, int(pre_filtered), filter_reason, parsed_at, int(ai_due)))
+              pitch, red_flags, int(db_pre_filtered), db_filter_reason, parsed_at, int(ai_due)))
         cur.execute("DELETE FROM tweets WHERE username = ?", (canon,))
         cur.execute("DELETE FROM mentions WHERE username = ?", (canon,))
         cur.executemany("INSERT INTO tweets (username,tweet) VALUES (?,?)",
@@ -277,7 +296,11 @@ async def _pg_save(username: str, scraped: dict, depth: int,
     mentions = scraped.get("mentions", [])
     parsed_at = datetime.now().isoformat()
 
-    is_valuable = category = stage = pitch = red_flags = None
+    is_valuable = None
+    category = stage = pitch = red_flags = None
+    db_pre_filtered = int(pre_filtered)
+    db_filter_reason = filter_reason
+
     if ai_res:
         is_valuable = 1 if ai_res.get("is_valuable") else 0
         category    = ai_res.get("category") or "Other"
@@ -295,6 +318,25 @@ async def _pg_save(username: str, scraped: dict, depth: int,
 
     async with pool.acquire() as conn:
         async with conn.transaction():
+            if ai_res:
+                row = await conn.fetchrow("SELECT parsed_at FROM startups WHERE username = $1", canon)
+                if row and row["parsed_at"]:
+                    parsed_at = row["parsed_at"]
+
+            if not ai_res and not pre_filtered:
+                row = await conn.fetchrow("""
+                    SELECT is_valuable, category, stage, pitch, red_flags, pre_filtered, filter_reason
+                    FROM startups WHERE username = $1
+                """, canon)
+                if row:
+                    is_valuable = row["is_valuable"]
+                    category    = row["category"]
+                    stage       = row["stage"]
+                    pitch       = row["pitch"]
+                    red_flags   = row["red_flags"]
+                    db_pre_filtered = row["pre_filtered"]
+                    db_filter_reason = row["filter_reason"]
+
             await conn.execute("""
                 INSERT INTO startups
                   (username,display_username,url,bio,depth,is_valuable,category,stage,
@@ -308,7 +350,7 @@ async def _pg_save(username: str, scraped: dict, depth: int,
                   filter_reason=EXCLUDED.filter_reason, parsed_at=EXCLUDED.parsed_at,
                   ai_due=EXCLUDED.ai_due
             """, canon, display, url, bio, depth, is_valuable, category, stage,
-                 pitch, red_flags, int(pre_filtered), filter_reason, parsed_at, int(ai_due))
+                 pitch, red_flags, int(db_pre_filtered), db_filter_reason, parsed_at, int(ai_due))
             await conn.execute("DELETE FROM tweets   WHERE username = $1", canon)
             await conn.execute("DELETE FROM mentions WHERE username = $1", canon)
             await conn.executemany(

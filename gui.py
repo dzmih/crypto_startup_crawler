@@ -92,7 +92,7 @@ class RadarGUI(tk.Tk):
         self._build_layout()
         self.refresh_all()
         self.after(120, self._drain_log_queue)
-        self.after(3000, self._periodic_refresh)
+        self.after(10000, self._periodic_refresh)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _create_vars(self) -> None:
@@ -104,13 +104,13 @@ class RadarGUI(tk.Tk):
 
         self.depth1_var = tk.StringVar(value="50")
         self.depth2_var = tk.StringVar(value="60")
-        self.concurrent_var = tk.StringVar(value="6")
+        self.concurrent_var = tk.StringVar(value="3")
         self.scroll_var = tk.StringVar(value="5")
         self.scroll_min_var = tk.StringVar(value="2")
         self.cache_ttl_var = tk.StringVar(value="72")
         self.ai_ttl_var = tk.StringVar(value="168")
         self.rps_var = tk.StringVar(value="1.5")
-        self.model_var = tk.StringVar(value="gemma2:27b")
+        self.model_var = tk.StringVar(value="llama3.1:8b")
         self.db_var = tk.StringVar(value=os.environ.get("STARTUPS_DB", "startups.db"))
         self.report_var = tk.StringVar(value=os.environ.get("CSR_REPORT_FILE", "report.md"))
         self.log_file_var = tk.StringVar(value=os.environ.get("CSR_GUI_LOG_FILE", DEFAULT_LOG_FILE))
@@ -118,6 +118,8 @@ class RadarGUI(tk.Tk):
         self.headless_var = tk.BooleanVar(value=True)
         self.report_raw_var = tk.BooleanVar(value=False)
         self.view_report_var = tk.StringVar(value="Текущий")
+        self._last_report_content = ""
+        self._last_report_raw = False
 
         self.total_profiles_var = tk.StringVar(value="0")
         self.startups_var = tk.StringVar(value="0")
@@ -801,13 +803,13 @@ class RadarGUI(tk.Tk):
         concurrent = self._require_int(self.concurrent_var, "Параллельно", minimum=1)
         scroll = self._require_int(self.scroll_var, "Scroll", minimum=1)
         scroll_min = self._require_int(self.scroll_min_var, "Min scroll", minimum=1)
-        cache_ttl = self._require_int(self.cache_ttl_var, "Cache TTL", minimum=1)
-        ai_ttl = self._require_int(self.ai_ttl_var, "AI TTL", minimum=1)
+        cache_ttl = self._require_int(self.cache_ttl_var, "Cache TTL", minimum=0)
+        ai_ttl = self._require_int(self.ai_ttl_var, "AI TTL", minimum=0)
         rps = self._require_float(self.rps_var, "RPS", minimum=0.1)
 
         if scroll_min > scroll:
             raise ValueError("Min scroll не может быть больше Scroll.")
-        if ai_ttl <= cache_ttl:
+        if cache_ttl > 0 and ai_ttl > 0 and ai_ttl <= cache_ttl:
             raise ValueError("AI TTL должен быть больше Cache TTL.")
 
         env = os.environ.copy()
@@ -980,7 +982,7 @@ class RadarGUI(tk.Tk):
         if self.process and self.process.poll() is None:
             self.refresh_overview()
             self.refresh_results()
-        self.after(3000, self._periodic_refresh)
+        self.after(10000, self._periodic_refresh)
 
     def refresh_stats(self) -> None:
         db_path = resolve_path(self.db_var.get(), "startups.db")
@@ -1243,7 +1245,15 @@ class RadarGUI(tk.Tk):
             content = report_path.read_text(encoding="utf-8")
         except OSError as exc:
             content = f"Не удалось прочитать отчет:\n{exc}"
-        if self.report_raw_var.get():
+            
+        raw_mode = self.report_raw_var.get()
+        if hasattr(self, '_last_report_content') and content == self._last_report_content and raw_mode == self._last_report_raw:
+            return  # No changes, avoid expensive re-render
+            
+        self._last_report_content = content
+        self._last_report_raw = raw_mode
+
+        if raw_mode:
             self._replace_text(self.report_text, content)
         else:
             self._render_report(content)
