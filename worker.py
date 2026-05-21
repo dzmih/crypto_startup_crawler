@@ -164,7 +164,12 @@ async def redis_worker_main():
             user_data_dir=f"twitter_profile_{WORKER_ID}",
             channel="chrome",
             headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-dev-shm-usage",
+            ],
             user_agent=ua,
         )
         log.info(f"[{WORKER_ID}] Браузер запущен, UA: {ua[:50]}...")
@@ -227,13 +232,17 @@ async def _process_queue(context, rq: RedisQueue, queue: str, depth: int):
 async def scrape_and_analyze(context, username: str, score: int,
                               depth: int, rq: RedisQueue | None = None):
     """Скрапит + анализирует один профиль и добавляет новых кандидатов в очередь."""
-    # Проверяем кэш
     cached = await db.get_profile(username)
-    if cached and is_cache_valid(cached.get("parsed_at")):
-        _metrics.cache_hits += 1
-        log.info(f"  [Кэш ✓] @{username}")
-        res = cached["scraped"]
-    else:
+    res = None
+    if cached:
+        has_tweets = len(cached.get("scraped", {}).get("tweets", [])) > 0
+        effective_ttl = CACHE_TTL_HOURS if has_tweets else 4
+        if is_cache_valid(cached.get("parsed_at"), ttl_hours=effective_ttl):
+            _metrics.cache_hits += 1
+            log.info(f"  [Кэш ✓] @{username} ({'есть твиты' if has_tweets else '0 твитов, кулдаун'})")
+            res = cached["scraped"]
+
+    if not res:
         res = await scrape_profile(context, username, score=score)
         if not res:
             return

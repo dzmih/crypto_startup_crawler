@@ -9,7 +9,12 @@ async def main():
             user_data_dir="twitter_profile",
             channel="chrome",
             headless=False,
-            args=["--disable-blink-features=AutomationControlled"]
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-dev-shm-usage",
+            ]
         )
         
         # launch_persistent_context автоматически создает одну страницу (вкладку)
