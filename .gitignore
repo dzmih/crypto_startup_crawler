@@ -4,6 +4,7 @@ twitter_profile/
 # Database and cache files
 *.db
 *.db-journal
+*.db-shm
 *.db-wal
 *.pma
 *.sqlite
@@ -49,3 +50,4 @@ Thumbs.db
 output.json
 report.md
 startups.db
+logs/
