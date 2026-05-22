@@ -152,9 +152,16 @@ async def redis_worker_main():
 
     # Если обе очереди пусты — заполняем из наших seed'ов
     if rq.queue_size(Q_DEPTH1) == 0 and rq.queue_size(Q_DEPTH2) == 0:
-        log.info(f"[{WORKER_ID}] Очереди пусты — заполняем из SEED_ACCOUNTS")
+        db_seeds = []
+        try:
+            db_seeds = await db.get_active_seeds()
+        except Exception as e:
+            log.warning(f"[{WORKER_ID}] Не удалось загрузить динамические семена: {e}")
+        
+        dynamic_seeds = list(set(SEED_ACCOUNTS + db_seeds))
+        log.info(f"[{WORKER_ID}] Очереди пусты — заполняем из {len(dynamic_seeds)} seed-источников (из них динамических: {len(db_seeds)})")
         # Добавляем seed'ы как начальные задания глубины 0
-        seeds_scored = {s.lower(): 10 for s in SEED_ACCOUNTS}
+        seeds_scored = {s.lower(): 10 for s in dynamic_seeds}
         rq.enqueue_many(Q_DEPTH1, seeds_scored)
 
     ua = random.choice(USER_AGENTS)

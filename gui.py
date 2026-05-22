@@ -1162,6 +1162,7 @@ class RadarGUI(tk.Tk):
             SELECT s.username, s.display_username, s.url, s.bio, s.depth, s.is_valuable,
                    s.category, s.stage, s.pitch, s.red_flags, s.pre_filtered,
                    s.filter_reason, s.parsed_at, s.ai_due,
+                   s.external_url, s.website_text, s.github_stats,
                    (SELECT COUNT(*) FROM tweets WHERE username = s.username) AS tweet_count,
                    (SELECT COUNT(*) FROM mentions WHERE username = s.username) AS mention_count
             FROM startups s
@@ -1286,7 +1287,8 @@ class RadarGUI(tk.Tk):
             rows = cur.execute(
                 """
                 SELECT username, display_username, url, bio, depth, is_valuable, category,
-                       stage, pitch, red_flags, pre_filtered, filter_reason, parsed_at, ai_due
+                       stage, pitch, red_flags, pre_filtered, filter_reason, parsed_at, ai_due,
+                       external_url, website_text, github_stats
                 FROM startups
                 ORDER BY parsed_at DESC
                 """
@@ -1370,6 +1372,12 @@ class RadarGUI(tk.Tk):
             lines.extend(["Почему интересно:", details["pitch"], ""])
         if details.get("red_flags"):
             lines.extend(["Риски:", details["red_flags"], ""])
+        if details.get("external_url"):
+            lines.extend(["Внешний сайт:", details["external_url"], ""])
+        if details.get("website_text"):
+            lines.extend(["Текст сайта (превью):", details["website_text"][:200] + "...", ""])
+        if details.get("github_stats"):
+            lines.extend(["GitHub Stats:", details["github_stats"], ""])
         mentions = details.get("mentions") or []
         if mentions:
             lines.append("Найденные упоминания:")

@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS startups (
     pre_filtered     INTEGER DEFAULT 0,
     filter_reason    TEXT,
     parsed_at        TEXT,
-    ai_due           INTEGER DEFAULT 0
+    ai_due           INTEGER DEFAULT 0,
+    is_seed          INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tweets (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,11 +79,12 @@ def _sqlite_init():
                     conn.execute(stmt)
                 except sqlite3.OperationalError:
                     pass
-        # Миграция старых таблиц — добавляем ai_due если нет
-        try:
-            conn.execute("ALTER TABLE startups ADD COLUMN ai_due INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
+        # Миграция старых таблиц — добавляем ai_due и is_seed если нет
+        for col in ["ai_due INTEGER DEFAULT 0", "is_seed INTEGER DEFAULT 0"]:
+            try:
+                conn.execute(f"ALTER TABLE startups ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
 
 def _sqlite_get(username: str) -> dict | None:
@@ -129,7 +131,7 @@ def _row_to_dict(row, tweets: list, mentions: list) -> dict:
 
 def _sqlite_save(username: str, scraped: dict, depth: int,
                  ai_res: dict | None, pre_filtered: bool,
-                 filter_reason: str | None, ai_due: bool):
+                 filter_reason: str | None, ai_due: bool, is_seed: bool = False):
     canon    = username.lower()
     display  = scraped.get("display_username") or username
     url      = scraped.get("url", f"https://x.com/{username}")
@@ -142,6 +144,7 @@ def _sqlite_save(username: str, scraped: dict, depth: int,
     category = stage = pitch = red_flags = None
     db_pre_filtered = int(pre_filtered)
     db_filter_reason = filter_reason
+    db_is_seed = int(is_seed)
 
     if ai_res:
         is_valuable = 1 if ai_res.get("is_valuable") else 0
@@ -175,13 +178,18 @@ def _sqlite_save(username: str, scraped: dict, depth: int,
             if row:
                 is_valuable, category, stage, pitch, red_flags, db_pre_filtered, db_filter_reason = row
 
+        cur.execute("SELECT is_seed FROM startups WHERE username = ?", (canon,))
+        row = cur.fetchone()
+        if row:
+            db_is_seed = max(db_is_seed, row[0] or 0)
+
         cur.execute("""
             INSERT OR REPLACE INTO startups
               (username,display_username,url,bio,depth,is_valuable,category,stage,
-               pitch,red_flags,pre_filtered,filter_reason,parsed_at,ai_due)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               pitch,red_flags,pre_filtered,filter_reason,parsed_at,ai_due,is_seed)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (canon, display, url, bio, depth, is_valuable, category, stage,
-              pitch, red_flags, int(db_pre_filtered), db_filter_reason, parsed_at, int(ai_due)))
+              pitch, red_flags, int(db_pre_filtered), db_filter_reason, parsed_at, int(ai_due), db_is_seed))
         cur.execute("DELETE FROM tweets WHERE username = ?", (canon,))
         cur.execute("DELETE FROM mentions WHERE username = ?", (canon,))
         cur.executemany("INSERT INTO tweets (username,tweet) VALUES (?,?)",
@@ -234,7 +242,8 @@ CREATE TABLE IF NOT EXISTS startups (
     pre_filtered     INTEGER DEFAULT 0,
     filter_reason    TEXT,
     parsed_at        TEXT,
-    ai_due           INTEGER DEFAULT 0
+    ai_due           INTEGER DEFAULT 0,
+    is_seed          INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tweets (
     id       SERIAL PRIMARY KEY,
@@ -270,6 +279,11 @@ async def _pg_init():
             stmt = stmt.strip()
             if stmt:
                 await conn.execute(stmt)
+        # Динамическая миграция для добавления is_seed в Postgres если таблицы уже есть
+        try:
+            await conn.execute("ALTER TABLE startups ADD COLUMN IF NOT EXISTS is_seed INTEGER DEFAULT 0")
+        except Exception:
+            pass
 
 async def _pg_get(username: str) -> dict | None:
     pool = await _pg_get_pool()
@@ -286,7 +300,7 @@ async def _pg_get(username: str) -> dict | None:
 
 async def _pg_save(username: str, scraped: dict, depth: int,
                    ai_res: dict | None, pre_filtered: bool,
-                   filter_reason: str | None, ai_due: bool):
+                   filter_reason: str | None, ai_due: bool, is_seed: bool = False):
     pool     = await _pg_get_pool()
     canon    = username.lower()
     display  = scraped.get("display_username") or username
@@ -340,17 +354,17 @@ async def _pg_save(username: str, scraped: dict, depth: int,
             await conn.execute("""
                 INSERT INTO startups
                   (username,display_username,url,bio,depth,is_valuable,category,stage,
-                   pitch,red_flags,pre_filtered,filter_reason,parsed_at,ai_due)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                   pitch,red_flags,pre_filtered,filter_reason,parsed_at,ai_due,is_seed)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
                 ON CONFLICT (username) DO UPDATE SET
                   display_username=EXCLUDED.display_username, url=EXCLUDED.url,
                   bio=EXCLUDED.bio, depth=EXCLUDED.depth, is_valuable=EXCLUDED.is_valuable,
                   category=EXCLUDED.category, stage=EXCLUDED.stage, pitch=EXCLUDED.pitch,
                   red_flags=EXCLUDED.red_flags, pre_filtered=EXCLUDED.pre_filtered,
                   filter_reason=EXCLUDED.filter_reason, parsed_at=EXCLUDED.parsed_at,
-                  ai_due=EXCLUDED.ai_due
+                  ai_due=EXCLUDED.ai_due, is_seed=GREATEST(startups.is_seed, EXCLUDED.is_seed)
             """, canon, display, url, bio, depth, is_valuable, category, stage,
-                 pitch, red_flags, int(db_pre_filtered), db_filter_reason, parsed_at, int(ai_due))
+                 pitch, red_flags, int(db_pre_filtered), db_filter_reason, parsed_at, int(ai_due), int(is_seed))
             await conn.execute("DELETE FROM tweets   WHERE username = $1", canon)
             await conn.execute("DELETE FROM mentions WHERE username = $1", canon)
             await conn.executemany(
@@ -359,6 +373,12 @@ async def _pg_save(username: str, scraped: dict, depth: int,
             await conn.executemany(
                 "INSERT INTO mentions (username,mention) VALUES ($1,$2)",
                 [(canon, m) for m in mentions])
+
+async def _pg_get_active_seeds() -> list[str]:
+    pool = await _pg_get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT username FROM startups WHERE is_seed = 1")
+        return [r["username"] for r in rows]
 
 async def _pg_load_valuable() -> list[dict]:
     pool = await _pg_get_pool()
@@ -403,13 +423,29 @@ async def save_profile(username: str, scraped: dict, depth: int,
                        ai_res: dict | None = None,
                        pre_filtered: bool = False,
                        filter_reason: str | None = None,
-                       ai_due: bool = False):
+                       ai_due: bool = False,
+                       is_seed: bool = False):
     if _BACKEND == "postgres":
-        await _pg_save(username, scraped, depth, ai_res, pre_filtered, filter_reason, ai_due)
+        await _pg_save(username, scraped, depth, ai_res, pre_filtered, filter_reason, ai_due, is_seed)
     else:
         async with _lock:
             await asyncio.to_thread(_sqlite_save, username, scraped, depth,
-                                    ai_res, pre_filtered, filter_reason, ai_due)
+                                    ai_res, pre_filtered, filter_reason, ai_due, is_seed)
+
+async def get_active_seeds() -> list[str]:
+    if _BACKEND == "postgres":
+        return await _pg_get_active_seeds()
+    async with _lock:
+        return await asyncio.to_thread(_sqlite_get_active_seeds)
+
+def _sqlite_get_active_seeds() -> list[str]:
+    with sqlite3.connect(_DB_NAME) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT username FROM startups WHERE is_seed = 1")
+            return [r[0] for r in cur.fetchall()]
+        except sqlite3.OperationalError:
+            return []
 
 async def load_valuable() -> list[dict]:
     if _BACKEND == "postgres":

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 import ollama
+from enrichment import enrich_project
 
 # ─────────────────────────────────────────────────────────────────────────────
 # НАСТРОЙКИ
@@ -391,7 +392,11 @@ def init_db_sync():
                 pre_filtered     INTEGER DEFAULT 0,
                 filter_reason    TEXT,
                 parsed_at        TEXT,
-                ai_due           INTEGER DEFAULT 0
+                ai_due           INTEGER DEFAULT 0,
+                external_url     TEXT,
+                website_text     TEXT,
+                github_stats     TEXT,
+                is_seed          INTEGER DEFAULT 0
             )
         """)
         conn.execute("""
@@ -410,11 +415,12 @@ def init_db_sync():
                 FOREIGN KEY(username) REFERENCES startups(username) ON DELETE CASCADE
             )
         """)
-        # Попытка добавить колонку ai_due если таблица уже существовала без неё
-        try:
-            conn.execute("ALTER TABLE startups ADD COLUMN ai_due INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # Колонка уже есть
+        # Попытка добавить колонки если таблица уже существовала
+        for col in ["ai_due INTEGER DEFAULT 0", "external_url TEXT", "website_text TEXT", "github_stats TEXT", "is_seed INTEGER DEFAULT 0"]:
+            try:
+                conn.execute(f"ALTER TABLE startups ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_is_valuable ON startups(is_valuable)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_username ON startups(username)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_due ON startups(ai_due)")
@@ -444,6 +450,9 @@ def _get_profile_sync(username: str) -> dict | None:
             "bio": row["bio"],
             "tweets": tweets,
             "mentions": mentions,
+            "external_url": dict(row).get("external_url", ""),
+            "website_text": dict(row).get("website_text", ""),
+            "github_stats": dict(row).get("github_stats", ""),
         }
         ai = None
         if row["is_valuable"] is not None or row["pre_filtered"]:
@@ -470,19 +479,24 @@ async def get_profile_from_db(username: str) -> dict | None:
 
 def _save_profile_sync(username: str, scraped_data: dict, depth: int,
                        ai_res: dict | None = None, pre_filtered: bool = False,
-                       filter_reason: str | None = None, ai_due: bool = False):
+                       filter_reason: str | None = None, ai_due: bool = False,
+                       is_seed: bool = False):
     canon   = username.lower()
     display = scraped_data.get("display_username") or username
     url     = scraped_data.get("url", f"https://x.com/{username}")
     bio     = scraped_data.get("bio", "")
     tweets  = scraped_data.get("tweets", [])
     mentions = scraped_data.get("mentions", [])
+    external_url = scraped_data.get("external_url", "")
+    website_text = scraped_data.get("website_text", "")
+    github_stats = scraped_data.get("github_stats", "")
     parsed_at = datetime.now().isoformat()
 
     is_valuable = None
     category = stage = pitch = red_flags = None
     db_pre_filtered = int(pre_filtered)
     db_filter_reason = filter_reason
+    db_is_seed = int(is_seed)
 
     if ai_res:
         is_valuable = 1 if ai_res.get("is_valuable") else 0
@@ -516,14 +530,21 @@ def _save_profile_sync(username: str, scraped_data: dict, depth: int,
             if row:
                 is_valuable, category, stage, pitch, red_flags, db_pre_filtered, db_filter_reason = row
 
+        cur.execute("SELECT is_seed FROM startups WHERE username = ?", (canon,))
+        row = cur.fetchone()
+        if row:
+            db_is_seed = max(db_is_seed, row[0] or 0)
+
         cur.execute("""
             INSERT OR REPLACE INTO startups (
                 username, display_username, url, bio, depth,
                 is_valuable, category, stage, pitch, red_flags,
-                pre_filtered, filter_reason, parsed_at, ai_due
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                pre_filtered, filter_reason, parsed_at, ai_due,
+                external_url, website_text, github_stats, is_seed
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (canon, display, url, bio, depth, is_valuable, category, stage,
-              pitch, red_flags, int(db_pre_filtered), db_filter_reason, parsed_at, int(ai_due)))
+              pitch, red_flags, int(db_pre_filtered), db_filter_reason, parsed_at, int(ai_due),
+              external_url, website_text, github_stats, db_is_seed))
         cur.execute("DELETE FROM tweets WHERE username = ?", (canon,))
         cur.execute("DELETE FROM mentions WHERE username = ?", (canon,))
         cur.executemany("INSERT INTO tweets (username, tweet) VALUES (?,?)",
@@ -534,10 +555,24 @@ def _save_profile_sync(username: str, scraped_data: dict, depth: int,
 
 async def save_profile_to_db(username: str, scraped_data: dict, depth: int,
                               ai_res: dict | None = None, pre_filtered: bool = False,
-                              filter_reason: str | None = None, ai_due: bool = False):
+                              filter_reason: str | None = None, ai_due: bool = False,
+                              is_seed: bool = False):
     async with _db_lock:
         await asyncio.to_thread(_save_profile_sync, username, scraped_data, depth,
-                                ai_res, pre_filtered, filter_reason, ai_due)
+                                ai_res, pre_filtered, filter_reason, ai_due, is_seed)
+
+def _get_active_seeds_sync() -> list[str]:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT username FROM startups WHERE is_seed = 1")
+            return [r[0] for r in cur.fetchall()]
+        except sqlite3.OperationalError:
+            # Столбец может отсутствовать при первом запуске до миграции
+            return []
+
+async def get_active_seeds_from_db() -> list[str]:
+    return await asyncio.to_thread(_get_active_seeds_sync)
 
 def _load_all_valuable_sync() -> list[dict]:
     with sqlite3.connect(DB_NAME) as conn:
@@ -679,6 +714,15 @@ async def _try_get_tweets(page, scroll: int) -> list[str]:
     logging.warning("Твиты не найдены")
     return []
 
+async def _try_get_external_url(page) -> str:
+    try:
+        el = await page.query_selector('[data-testid="UserUrl"]')
+        if el:
+            return (await el.inner_text()).strip()
+    except Exception:
+        pass
+    return ""
+
 async def scrape_profile(context, username: str, score: int = 0) -> dict | None:
     """Парсит профиль: rate limiter → семафор → viewport jitter → mouse emulation → dynamic scroll."""
     await get_rate_limiter().acquire()
@@ -710,6 +754,7 @@ async def scrape_profile(context, username: str, score: int = 0) -> dict | None:
             "tweets": [],
             "mentions": [],
             "url": f"https://x.com/{username}",
+            "external_url": "",
         }
 
         try:
@@ -754,6 +799,7 @@ async def scrape_profile(context, username: str, score: int = 0) -> dict | None:
                 pass
 
             result["bio"]      = await _try_get_bio(page)
+            result["external_url"] = await _try_get_external_url(page)
             scroll_n           = get_scroll_rounds(score)
             result["tweets"]   = await _try_get_tweets(page, scroll=scroll_n)
             result["mentions"] = extract_mentions([result["bio"]] + result["tweets"])
@@ -772,18 +818,21 @@ async def scrape_profile(context, username: str, score: int = 0) -> dict | None:
 # AI-АНАЛИЗ (batch-friendly: принимает один профиль, кэш в БД)
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def analyze_with_ai(username: str, bio: str, tweets: list[str]) -> dict:
+async def analyze_with_ai(username: str, bio: str, tweets: list[str], website_text: str = "", github_stats: str = "") -> dict:
     # Берём только 5 самых коротких/информативных твитов по 150 символов — достаточно для классификации
     tweets_text = "\n".join(f"• {t[:150]}" for t in tweets[:5]) or "(no tweets)"
     # Обрезаем bio до 300 символов
     bio_short = (bio or "(no bio)")[:300]
+    web_context = f"\nWebsite Content: {website_text[:1000]}" if website_text else ""
+    git_context = f"\nGitHub Stats: {github_stats}" if github_stats else ""
 
     prompt = f"""Crypto investor analyst. Is @{username} an early-stage Web3/crypto TECHNOLOGY STARTUP?
 
 Bio: {bio_short}
-Tweets: {tweets_text}
+Tweets: {tweets_text}{web_context}{git_context}
 
 TRUE if: building a product (protocol/app/tool/infra) + web3/crypto + early stage.
+(Pay high attention to GitHub Stats and Website Content if available - they are strong true signals).
 FALSE if: VC fund, media, journalist, politician, large exchange, memecoin, spam.
 VC-backed startups ("Backed by Paradigm", "Funded by a16z") → TRUE.
 
@@ -878,12 +927,21 @@ async def analyze_profile(u: str, res: dict, depth: int) -> dict | None:
     pre_filtered, reason = pre_filter_check(res.get("bio", ""), res.get("tweets", []))
     if pre_filtered:
         _metrics.pre_filtered += 1
-        logging.info(f"  Анализ @{u}... skip (pre-filtered: {reason})")
-        await save_profile_to_db(u, res, depth=depth, pre_filtered=True, filter_reason=reason)
+        is_seed = reason in ["venture capital", "vc firm", "hedge fund"]
+        if is_seed:
+            logging.info(f"  [Seed-Эволюция] Обнаружен новый фонд @{u}. Добавляем в Seeds!")
+        else:
+            logging.info(f"  Анализ @{u}... skip (pre-filtered: {reason})")
+        await save_profile_to_db(u, res, depth=depth, pre_filtered=True, filter_reason=reason, is_seed=is_seed)
         return None
 
     # AI-анализ
-    ai = await analyze_with_ai(u, res.get("bio", ""), res.get("tweets", []))
+    # Добавляем этап обогащения
+    website_text, github_stats = await enrich_project(res.get("external_url", ""), res.get("bio", ""))
+    res["website_text"] = website_text
+    res["github_stats"] = github_stats
+    
+    ai = await analyze_with_ai(u, res.get("bio", ""), res.get("tweets", []), website_text, github_stats)
     if ai.get("red_flags") == "AI error":
         logging.warning(f"  Анализ @{u}... AI error (retry later, ai_due=True)")
         # Помечаем ai_due=True — при следующем запуске повторим
@@ -892,8 +950,14 @@ async def analyze_profile(u: str, res: dict, depth: int) -> dict | None:
         return None
 
     verdict = "STARTUP" if ai["is_valuable"] else "skip"
+    # Решаем, является ли это новым семенем (инфраструктура или L1/L2)
+    is_seed = False
+    if ai.get("is_valuable") and ai.get("category") in ["Infrastructure", "L1/L2"]:
+        is_seed = True
+        logging.info(f"  [Seed-Эволюция] Обнаружена экосистема/инфраструктура @{u}. Добавляем в Seeds!")
+
     logging.info(f"  Анализ @{u}... {verdict} [{ai['category']}]")
-    await save_profile_to_db(u, res, depth=depth, ai_res=ai)
+    await save_profile_to_db(u, res, depth=depth, ai_res=ai, is_seed=is_seed)
     ai["_is_fresh"] = True
     return ai
 
@@ -938,6 +1002,19 @@ def generate_report(startups: list[dict]) -> str:
                 lines += ["", "**Почему интересно:**", f"> {ai['pitch']}"]
             if ai.get("red_flags"):
                 lines += ["", f"**Риски:** {ai['red_flags']}"]
+                
+            external_url = data.get("external_url")
+            github_stats = data.get("github_stats")
+            if external_url:
+                lines += ["", f"**Сайт:** {external_url}"]
+            if github_stats:
+                try:
+                    stats = json.loads(github_stats)
+                    stars = stats.get("stars", 0)
+                    lang = stats.get("language", "Unknown")
+                    lines += [f"**GitHub:** {stars} ⭐ | {lang}"]
+                except:
+                    lines += [f"**GitHub Stats:** {github_stats}"]
             tweets = data.get("tweets", [])
             if tweets:
                 lines += ["", "**Свежие твиты:**"]
@@ -970,6 +1047,16 @@ async def main():
 
     await init_db()
 
+    # Загружаем динамические семена из базы данных
+    db_seeds = []
+    try:
+        db_seeds = await get_active_seeds_from_db()
+    except Exception as e:
+        logging.warning(f"Не удалось загрузить динамические семена из БД: {e}")
+
+    dynamic_seeds = list(set(SEED_ACCOUNTS + db_seeds))
+    SKIP_ACCOUNTS.update([s.lower() for s in dynamic_seeds])
+
     main_report = Path(REPORT_FILE)
     reports_dir = main_report.parent / "reports"
     reports_dir.mkdir(exist_ok=True)
@@ -981,11 +1068,11 @@ async def main():
 
     logging.info("=" * 60)
     logging.info("  CRYPTO STARTUP RADAR v3.2 — краулер запущен")
-    logging.info(f"  Параллельность: {MAX_CONCURRENT}  |  Seed: {len(SEED_ACCOUNTS)}")
+    logging.info(f"  Параллельность: {MAX_CONCURRENT}  |  Seed: {len(dynamic_seeds)} (из них динамических: {len(db_seeds)})")
     logging.info(f"  Cache TTL: {CACHE_TTL_HOURS}ч  |  AI TTL: {AI_TTL_HOURS}ч")
     logging.info("=" * 60)
 
-    global_visited: set[str] = {s.lower() for s in SEED_ACCOUNTS}
+    global_visited: set[str] = {s.lower() for s in dynamic_seeds}
     score_map: dict[str, int] = {}
 
     d1_analyzed: list[dict] = []
@@ -1009,9 +1096,9 @@ async def main():
         )
         try:
             # ── ФАЗА 1: Seed-аккаунты ────────────────────────────────────────────
-            logging.info(f"[1/4] Парсинг {len(SEED_ACCOUNTS)} seed-аккаунтов...")
+            logging.info(f"[1/4] Парсинг {len(dynamic_seeds)} seed-аккаунтов...")
             seed_results = await asyncio.gather(
-                *[get_or_scrape_profile(context, a, depth=0, score=10) for a in SEED_ACCOUNTS],
+                *[get_or_scrape_profile(context, a, depth=0, score=10) for a in dynamic_seeds],
                 return_exceptions=True,
             )
 
